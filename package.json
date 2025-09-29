@@ -1,0 +1,16 @@
+{
+  "name": "skai-elevenlabs-gateway",
+  "version": "1.0.0",
+  "description": "Twilio Media Streams → (ElevenLabs-ready) Gateway → TaskRouter risk routing",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "body-parser": "^1.20.2",
+    "express": "^4.19.2",
+    "node-fetch": "^3.3.2",
+    "ws": "^8.17.1"
+  }
+}
