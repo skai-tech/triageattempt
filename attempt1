@@ -1,0 +1,163 @@
+{
+  "name": "skai-elevenlabs-gateway",
+  "version": "1.0.0",
+  "description": "Twilio Media Streams → (ElevenLabs-ready) Gateway → TaskRouter risk routing",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "body-parser": "^1.20.2",
+    "express": "^4.19.2",
+    "node-fetch": "^3.3.2",
+    "ws": "^8.17.1"
+  }
+}
+// Minimal, deploy-ready gateway for Twilio Media Streams.
+// - Exposes WS at /ws for <Start><Stream>.
+// - Accumulates transcript text (stub — replace with ElevenLabs later).
+// - Classifies risk (low/medium/high/critical) with simple rules.
+// - POSTs { CallSid, risk, summary, language } to your Twilio /route Function.
+
+import express from "express";
+import { WebSocketServer } from "ws";
+import fetch from "node-fetch";
+import bodyParser from "body-parser";
+
+// ====== REQUIRED ENVs (set these on Render) ======
+// ROUTE_URL        -> your Twilio Function /route URL, e.g. https://<subdomain>.twil.io/route
+// ROUTE_BEARER     -> optional shared secret; set also in your Function
+// LANGUAGE_DEFAULT -> optional, default "en"
+// PORT             -> provided by Render; we also fall back to 8080 locally
+// =================================================
+
+// --- small helpers ---
+const LANGUAGE_DEFAULT = process.env.LANGUAGE_DEFAULT || "en";
+
+// crude risk classifier; swap with your LLM/ElevenLabs signals when ready
+function classifyRisk(text) {
+  const t = (text || "").toLowerCase();
+
+  // hard-immediacy triggers -> critical
+  const hard = ["right now", "tonight", "kill myself", "end my life", "take pills", "overdose", "gun", "knife", "hanging", "bridge"];
+  if (hard.some(k => t.includes(k))) return "critical";
+
+  // plan/means -> high
+  const hi = ["i have a plan", "i have a method", "i bought pills", "i bought a rope", "i wrote a note", "suicide"];
+  if (hi.some(k => t.includes(k))) return "high";
+
+  // distress/self-harm -> medium
+  const med = ["self harm", "cutting", "i feel hopeless", "i feel helpless", "panic", "i can't go on"];
+  if (med.some(k => t.includes(k))) return "medium";
+
+  return "low";
+}
+
+function summarizeForCounselor(text) {
+  const s = (text || "").replace(/\s+/g, " ").trim();
+  return s.length > 400 ? s.slice(0, 397) + "..." : s;
+}
+
+async function routeToTwilio({ callSid, risk, summary, language }) {
+  if (!process.env.ROUTE_URL) {
+    console.error("ROUTE_URL env not set.");
+    return;
+  }
+  const body = new URLSearchParams({
+    CallSid: callSid || "",
+    risk: risk || "medium",
+    summary: summary || "",
+    language: language || LANGUAGE_DEFAULT
+  });
+
+  const headers = { "Content-Type": "application/x-www-form-urlencoded" };
+  if (process.env.ROUTE_BEARER) headers["Authorization"] = `Bearer ${process.env.ROUTE_BEARER}`;
+
+  const res = await fetch(process.env.ROUTE_URL, { method: "POST", headers, body });
+  const txt = await res.text().catch(() => "");
+  console.log("Route → /route status", res.status, txt.slice(0, 200));
+}
+
+// --- app + ws setup ---
+const app = express();
+app.use(bodyParser.urlencoded({ extended: false }));
+app.use(bodyParser.json());
+
+// health check
+app.get("/", (_req, res) => res.status(200).send("OK"));
+
+// optional HTTP test to force a route without WS (handy for smoke tests)
+app.post("/simulate", async (req, res) => {
+  try {
+    const { callSid = "TEST", text = "", language = LANGUAGE_DEFAULT } = req.body;
+    const risk = classifyRisk(text);
+    const summary = summarizeForCounselor(text);
+    await routeToTwilio({ callSid, risk, summary, language });
+    res.json({ ok: true, risk, summaryLen: summary.length });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false });
+  }
+});
+
+// start server
+const server = app.listen(process.env.PORT || 8080, () => {
+  console.log("Gateway listening on", server.address().port);
+});
+
+// WS endpoint for Twilio Media Streams
+// Twilio will connect with JSON messages:
+//  - event:"start" { start: { callSid } }
+//  - event:"media" { media: { payload: <base64 audio> } }
+//  - event:"stop"
+const wss = new WebSocketServer({ server, path: "/ws" });
+
+wss.on("connection", (socket) => {
+  console.log("Twilio WS connected");
+  let callSid = null;
+  let bufferText = "";
+  let decided = false;
+  const language = LANGUAGE_DEFAULT;
+
+  socket.on("message", async (data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+
+      if (msg.event === "start") {
+        callSid = msg.start?.callSid || callSid;
+        console.log("CallSid:", callSid);
+        return;
+      }
+
+      if (msg.event === "media") {
+        // NOTE: This MVP does *not* transcribe audio.
+        // For a working end-to-end demo, we simulate transcript growth here.
+        // Replace this with: send audio to ElevenLabs Realtime → append returned text.
+        bufferText += " " + "(caller speaking)";
+      }
+
+      if (msg.event === "stop") {
+        console.log("Twilio WS stop received");
+        // If you didn’t already decide, make a final best-effort decision:
+        if (!decided) {
+          const risk = classifyRisk(bufferText);
+          const summary = summarizeForCounselor(bufferText);
+          await routeToTwilio({ callSid, risk, summary, language });
+        }
+      }
+
+      // Example: make a decision after some content accumulates
+      if (!decided && bufferText.length > 180) {
+        decided = true;
+        const risk = classifyRisk(bufferText);
+        const summary = summarizeForCounselor(bufferText);
+        await routeToTwilio({ callSid, risk, summary, language });
+      }
+    } catch (e) {
+      console.error("WS parse error", e);
+    }
+  });
+
+  socket.on("close", () => console.log("Twilio WS closed"));
+});
